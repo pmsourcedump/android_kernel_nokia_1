@@ -21,15 +21,17 @@ struct zcomp_strm {
 	 * working memory)
 	 */
 	void *private;
+	void *private_secondary;
 	/* used in multi stream backend, protected by backend strm_lock */
 	struct list_head list;
 };
 
 /* static compression backend */
+#ifdef CONFIG_ZSM
 struct zcomp_backend {
-	int (*compress)(const unsigned char *src, unsigned char *dst,
-			size_t *dst_len, void *private);
 
+	int (*compress)(const unsigned char *src, unsigned char *dst,
+			size_t *dst_len, void *private, int *checksum);
 	int (*decompress)(const unsigned char *src, size_t src_len,
 			unsigned char *dst);
 
@@ -38,7 +40,22 @@ struct zcomp_backend {
 
 	const char *name;
 };
+#else
+struct zcomp_backend {
 
+	int (*compress)(const unsigned char *src, unsigned char *dst,
+			size_t *dst_len, void *private);
+	int (*decompress)(const unsigned char *src, size_t src_len,
+			unsigned char *dst);
+
+	void *(*create)(void);
+	void (*destroy)(void *private);
+
+	const char *name;
+
+	struct zcomp_backend *secondary;
+};
+#endif
 /* dynamic per-device compression frontend */
 struct zcomp {
 	void *stream;
@@ -57,12 +74,15 @@ void zcomp_destroy(struct zcomp *comp);
 
 struct zcomp_strm *zcomp_strm_find(struct zcomp *comp);
 void zcomp_strm_release(struct zcomp *comp, struct zcomp_strm *zstrm);
-
+#ifdef CONFIG_ZSM
+int zcomp_compress_zram(struct zcomp *comp, struct zcomp_strm *zstrm,
+		const unsigned char *src, size_t *dst_len, int *checksum);
+#else
 int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		const unsigned char *src, size_t *dst_len);
-
+		const unsigned char *src, size_t *dst_len, bool);
+#endif
 int zcomp_decompress(struct zcomp *comp, const unsigned char *src,
-		size_t src_len, unsigned char *dst);
+		size_t src_len, unsigned char *dst, bool);
 
 bool zcomp_set_max_streams(struct zcomp *comp, int num_strm);
 #endif /* _ZCOMP_H_ */

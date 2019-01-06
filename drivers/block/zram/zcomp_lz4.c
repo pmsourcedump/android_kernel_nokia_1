@@ -14,6 +14,7 @@
 #include <linux/mm.h>
 
 #include "zcomp_lz4.h"
+#include "zcomp_zstd.h"
 
 static void *zcomp_lz4_create(void)
 {
@@ -41,14 +42,21 @@ static void zcomp_lz4_destroy(void *private)
 {
 	kvfree(private);
 }
-
+#ifdef CONFIG_ZSM
+static int zcomp_lz4_compress_zram(const unsigned char *src, unsigned char *dst,
+		size_t *dst_len, void *private, int *checksum)
+{
+	/* return  : Success if return 0 */
+	return lz4_compress_zram(src, PAGE_SIZE, dst, dst_len, private, checksum);
+}
+#else
 static int zcomp_lz4_compress(const unsigned char *src, unsigned char *dst,
 		size_t *dst_len, void *private)
 {
 	/* return  : Success if return 0 */
 	return lz4_compress(src, PAGE_SIZE, dst, dst_len, private);
 }
-
+#endif
 static int zcomp_lz4_decompress(const unsigned char *src, size_t src_len,
 		unsigned char *dst)
 {
@@ -56,11 +64,22 @@ static int zcomp_lz4_decompress(const unsigned char *src, size_t src_len,
 	/* return  : Success if return 0 */
 	return lz4_decompress_unknownoutputsize(src, src_len, dst, &dst_len);
 }
-
+#ifdef CONFIG_ZSM
+struct zcomp_backend zcomp_lz4 = {
+	.compress = zcomp_lz4_compress_zram,
+	.decompress = zcomp_lz4_decompress,
+	.create = zcomp_lz4_create,
+	.destroy = zcomp_lz4_destroy,
+	.name = "lz4",
+};
+#else
 struct zcomp_backend zcomp_lz4 = {
 	.compress = zcomp_lz4_compress,
 	.decompress = zcomp_lz4_decompress,
 	.create = zcomp_lz4_create,
 	.destroy = zcomp_lz4_destroy,
 	.name = "lz4",
+	.secondary = &zcomp_zstd,
 };
+#endif
+

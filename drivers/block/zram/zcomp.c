@@ -19,6 +19,12 @@
 #ifdef CONFIG_ZRAM_LZ4_COMPRESS
 #include "zcomp_lz4.h"
 #endif
+#ifdef CONFIG_ZRAM_LZ4K_COMPRESS
+#include "zcomp_lz4k.h"
+#endif
+#ifdef CONFIG_ZRAM_ZSTD_COMPRESS
+#include "zcomp_zstd.h"
+#endif
 
 /*
  * single zcomp_strm backend
@@ -48,6 +54,12 @@ static struct zcomp_backend *backends[] = {
 #ifdef CONFIG_ZRAM_LZ4_COMPRESS
 	&zcomp_lz4,
 #endif
+#ifdef CONFIG_ZRAM_LZ4K_COMPRESS
+	&zcomp_lz4k,
+#endif
+#ifdef CONFIG_ZRAM_ZSTD_COMPRESS
+	&zcomp_zstd,
+#endif
 	NULL
 };
 
@@ -66,6 +78,8 @@ static void zcomp_strm_free(struct zcomp *comp, struct zcomp_strm *zstrm)
 {
 	if (zstrm->private)
 		comp->backend->destroy(zstrm->private);
+	if (zstrm->private_secondary)
+		comp->backend->destroy(zstrm->private_secondary);
 	free_pages((unsigned long)zstrm->buffer, 1);
 	kfree(zstrm);
 }
@@ -81,6 +95,12 @@ static struct zcomp_strm *zcomp_strm_alloc(struct zcomp *comp)
 		return NULL;
 
 	zstrm->private = comp->backend->create();
+
+	// secondary
+	if (comp->backend->secondary)
+		zstrm->private_secondary = comp->backend->secondary->create();
+	else
+		zstrm->private_secondary = NULL;
 	/*
 	 * allocate 2 pages. 1 for compressed data, plus 1 extra for the
 	 * case when compressed size is larger than the original one
@@ -221,6 +241,10 @@ static int zcomp_strm_multi_create(struct zcomp *comp, int max_strm)
 static struct zcomp_strm *zcomp_strm_single_find(struct zcomp *comp)
 {
 	struct zcomp_strm_single *zs = comp->stream;
+
+	if (!zs)
+		return NULL;
+
 	mutex_lock(&zs->strm_lock);
 	return zs->zstrm;
 }
@@ -243,6 +267,10 @@ static void zcomp_strm_single_destroy(struct zcomp *comp)
 	struct zcomp_strm_single *zs = comp->stream;
 	zcomp_strm_free(comp, zs->zstrm);
 	kfree(zs);
+
+	/* Nullify the pointer & dump backtrace */
+	comp->stream = NULL;
+	dump_stack();
 }
 
 static int zcomp_strm_single_create(struct zcomp *comp)
@@ -262,6 +290,10 @@ static int zcomp_strm_single_create(struct zcomp *comp)
 	zs->zstrm = zcomp_strm_alloc(comp);
 	if (!zs->zstrm) {
 		kfree(zs);
+
+		/* Nullify the pointer & dump backtrace */
+		comp->stream = NULL;
+		dump_stack();
 		return -ENOMEM;
 	}
 	return 0;
@@ -300,17 +332,29 @@ void zcomp_strm_release(struct zcomp *comp, struct zcomp_strm *zstrm)
 {
 	comp->strm_release(comp, zstrm);
 }
-
-int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
-		const unsigned char *src, size_t *dst_len)
+#ifdef CONFIG_ZSM
+int zcomp_compress_zram(struct zcomp *comp, struct zcomp_strm *zstrm,
+		const unsigned char *src, size_t *dst_len, int *checksum)
 {
+	return comp->backend->compress(src, zstrm->buffer, dst_len,
+			zstrm->private, checksum);
+}
+#else
+int zcomp_compress(struct zcomp *comp, struct zcomp_strm *zstrm,
+		const unsigned char *src, size_t *dst_len, bool use_secondary)
+{
+	if (use_secondary && comp->backend->secondary)
+		return comp->backend->secondary->compress(src, zstrm->buffer, dst_len,
+                        zstrm->private_secondary);
 	return comp->backend->compress(src, zstrm->buffer, dst_len,
 			zstrm->private);
 }
-
+#endif
 int zcomp_decompress(struct zcomp *comp, const unsigned char *src,
-		size_t src_len, unsigned char *dst)
+		size_t src_len, unsigned char *dst, bool use_secondary)
 {
+	if (use_secondary && comp->backend->secondary)
+		return comp->backend->secondary->decompress(src, src_len, dst);
 	return comp->backend->decompress(src, src_len, dst);
 }
 

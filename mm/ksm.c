@@ -23,7 +23,7 @@
 #include <linux/pagemap.h>
 #include <linux/rmap.h>
 #include <linux/spinlock.h>
-#include <linux/jhash.h>
+#include <linux/xxhash.h>
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/wait.h>
@@ -37,6 +37,11 @@
 #include <linux/freezer.h>
 #include <linux/oom.h>
 #include <linux/numa.h>
+#ifdef CONFIG_HAS_EARLYSUSPEND
+#include <linux/earlysuspend.h>
+#endif
+#include <linux/cpumask.h>
+#include <linux/fb.h>
 
 #include <asm/tlbflush.h>
 #include "internal.h"
@@ -141,6 +146,7 @@ struct stable_node {
 	};
 	struct hlist_head hlist;
 	unsigned long kpfn;
+	u32 checksum;
 #ifdef CONFIG_NUMA
 	int nid;
 #endif
@@ -222,6 +228,11 @@ static unsigned int ksm_thread_pages_to_scan = 100;
 
 /* Milliseconds ksmd should sleep between batches */
 static unsigned int ksm_thread_sleep_millisecs = 20;
+
+#ifdef CONFIG_KSM_GO
+/* Merge page or not after once scan */
+static bool ksm_find_same_page = true;
+#endif
 
 #ifdef CONFIG_NUMA
 /* Zeroed when merging across nodes is not allowed */
@@ -830,27 +841,31 @@ static u32 calc_checksum(struct page *page)
 {
 	u32 checksum;
 	void *addr = kmap_atomic(page);
-	checksum = jhash2(addr, PAGE_SIZE / 4, 17);
+	checksum = xxh32(addr, PAGE_SIZE, 17);
 	kunmap_atomic(addr);
 	return checksum;
 }
 
-static int memcmp_pages(struct page *page1, struct page *page2)
+static int memcmp_pages(struct page *page1, struct page *page2, u32 checksum1, u32 checksum2)
 {
 	char *addr1, *addr2;
 	int ret;
 
-	addr1 = kmap_atomic(page1);
-	addr2 = kmap_atomic(page2);
-	ret = memcmp(addr1, addr2, PAGE_SIZE);
-	kunmap_atomic(addr2);
-	kunmap_atomic(addr1);
+	if (checksum1 == checksum2) {
+		addr1 = kmap_atomic(page1);
+		addr2 = kmap_atomic(page2);
+		ret = memcmp(addr1, addr2, PAGE_SIZE);
+		kunmap_atomic(addr2);
+		kunmap_atomic(addr1);
+	} else {
+		return (checksum1 > checksum2) ? 1 : -1;
+	}
 	return ret;
 }
 
 static inline int pages_identical(struct page *page1, struct page *page2)
 {
-	return !memcmp_pages(page1, page2);
+	return !memcmp_pages(page1, page2, 0, 0);
 }
 
 static int write_protect_page(struct vm_area_struct *vma, struct page *page,
@@ -1149,7 +1164,7 @@ static struct page *try_to_merge_two_pages(struct rmap_item *rmap_item,
  * This function returns the stable tree node of identical content if found,
  * NULL otherwise.
  */
-static struct page *stable_tree_search(struct page *page)
+static struct page *stable_tree_search(struct page *page, u32 checksum)
 {
 	int nid;
 	struct rb_root *root;
@@ -1181,7 +1196,7 @@ again:
 		if (!tree_page)
 			return NULL;
 
-		ret = memcmp_pages(page, tree_page);
+		ret = memcmp_pages(page, tree_page, checksum, stable_node->checksum);
 		put_page(tree_page);
 
 		parent = *new;
@@ -1249,7 +1264,7 @@ replace:
  * This function returns the stable tree node just allocated on success,
  * NULL otherwise.
  */
-static struct stable_node *stable_tree_insert(struct page *kpage)
+static struct stable_node *stable_tree_insert(struct page *kpage, u32 checksum)
 {
 	int nid;
 	unsigned long kpfn;
@@ -1273,7 +1288,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 		if (!tree_page)
 			return NULL;
 
-		ret = memcmp_pages(kpage, tree_page);
+		ret = memcmp_pages(kpage, tree_page, checksum, stable_node->checksum);
 		put_page(tree_page);
 
 		parent = *new;
@@ -1297,6 +1312,7 @@ static struct stable_node *stable_tree_insert(struct page *kpage)
 
 	INIT_HLIST_HEAD(&stable_node->hlist);
 	stable_node->kpfn = kpfn;
+	stable_node->checksum = checksum;
 	set_page_stable_node(kpage, stable_node);
 	DO_NUMA(stable_node->nid = nid);
 	rb_link_node(&stable_node->node, parent, new);
@@ -1352,7 +1368,7 @@ struct rmap_item *unstable_tree_search_insert(struct rmap_item *rmap_item,
 			return NULL;
 		}
 
-		ret = memcmp_pages(page, tree_page);
+		ret = memcmp_pages(page, tree_page, rmap_item->oldchecksum, tree_rmap_item->oldchecksum);
 
 		parent = *new;
 		if (ret < 0) {
@@ -1402,6 +1418,9 @@ static void stable_tree_append(struct rmap_item *rmap_item,
 		ksm_pages_sharing++;
 	else
 		ksm_pages_shared++;
+#ifdef CONFIG_KSM_GO
+	ksm_find_same_page = true;
+#endif
 }
 
 /*
@@ -1437,7 +1456,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 	}
 
 	/* We first start with searching the page inside the stable tree */
-	kpage = stable_tree_search(page);
+	kpage = stable_tree_search(page, rmap_item->oldchecksum);
 	if (kpage == page && rmap_item->head == stable_node) {
 		put_page(kpage);
 		return;
@@ -1484,7 +1503,7 @@ static void cmp_and_merge_page(struct page *page, struct rmap_item *rmap_item)
 			 * node in the stable tree and add both rmap_items.
 			 */
 			lock_page(kpage);
-			stable_node = stable_tree_insert(kpage);
+			stable_node = stable_tree_insert(kpage, checksum);
 			if (stable_node) {
 				stable_tree_append(tree_rmap_item, stable_node);
 				stable_tree_append(rmap_item, stable_node);
@@ -1706,6 +1725,152 @@ static void ksm_do_scan(unsigned int scan_npages)
 	}
 }
 
+/*
+ * LCH_ADD: ksm kernel control interface for run or stop
+ * flags: 1(KSM_RUN_MERGE) sets ksmd running
+ *            0 sets ksmd stop running
+ * return: 0 success
+ *            others error
+ */
+#define KSM_KCTL_INTERFACE
+
+#ifdef KSM_KCTL_INTERFACE
+static ssize_t ksm_run_change(unsigned long flags)
+{
+	int err = 0;
+
+	if (flags > KSM_RUN_UNMERGE)
+		return -EINVAL;
+
+	/*
+	 * KSM_RUN_MERGE sets ksmd running, and 0 stops it running.
+	 * KSM_RUN_UNMERGE stops it running and unmerges all rmap_items,
+	 * breaking COW to free the pages_shared (but leaves mm_slots
+	 * on the list for when ksmd may be set running again).
+	 */
+
+	mutex_lock(&ksm_thread_mutex);
+	wait_while_offlining();
+	if (ksm_run != flags) {
+		ksm_run = flags;
+		if (flags & KSM_RUN_UNMERGE) {
+			set_current_oom_origin();
+			err = unmerge_and_remove_all_rmap_items();
+			clear_current_oom_origin();
+			if (err)
+				ksm_run = KSM_RUN_STOP;
+		}
+	}
+	mutex_unlock(&ksm_thread_mutex);
+
+	if (flags & KSM_RUN_MERGE)
+		wake_up_interruptible(&ksm_thread_wait);
+
+	return err;
+}
+
+static void ksm_tuning_pressure(void)
+{
+#ifdef CONFIG_KSM_GO
+	if (ksm_find_same_page) {
+		ksm_thread_sleep_millisecs = 20;
+		ksm_thread_pages_to_scan = 100;
+	} else {
+		ksm_thread_sleep_millisecs += 50;
+		if (ksm_thread_sleep_millisecs > 1000) {
+			ksm_thread_sleep_millisecs = 1000;
+		}
+		ksm_thread_pages_to_scan += 100;
+		if (ksm_thread_pages_to_scan > 500) {
+			ksm_thread_pages_to_scan = 500;
+		}
+	}
+
+	ksm_find_same_page = false;
+#else
+#if NR_CPUS > 1
+	if (bat_is_charger_exist() == KAL_TRUE) {
+		if (ksm_thread_sleep_millisecs == 20 &&
+			ksm_thread_pages_to_scan == 100)
+			return;
+		/*set to default value */
+		ksm_thread_sleep_millisecs = 20;
+		ksm_thread_pages_to_scan = 100;
+	} else {
+		int num_cpus = num_online_cpus();
+		int three_quater_cpus = ((3 * num_possible_cpus() * 10)/4 + 5)/10;
+		int one_half_cpus = num_possible_cpus() >> 1;
+
+		if (num_cpus >= three_quater_cpus) {
+			ksm_thread_sleep_millisecs = 20;
+			ksm_thread_pages_to_scan = 100;
+		} else if (num_cpus >= one_half_cpus) {
+			ksm_thread_sleep_millisecs = 3000;
+			ksm_thread_pages_to_scan = 200;
+		} else {
+			ksm_thread_sleep_millisecs = 10000;
+			ksm_thread_pages_to_scan = 200;
+		}
+	}
+#endif
+#endif
+}
+
+#ifdef CONFIG_HAS_EARLYSUSPEND
+static void ksm_early_suspend(struct early_suspend *h)
+{
+	ksm_run_change(KSM_RUN_STOP);
+}
+
+static void ksm_late_resume(struct early_suspend *h)
+{
+	ksm_run_change(KSM_RUN_MERGE);
+}
+
+static struct early_suspend ksm_early_suspend_handler = {
+	.suspend = ksm_early_suspend,
+	.resume = ksm_late_resume,
+};
+#else /* no CONFIG_HAS_EARLYSUSPEND*/
+static int ksm_fb_notifier_callback(struct notifier_block *p,
+				unsigned long event, void *data)
+{
+	int blank;
+
+	if (event != FB_EVENT_BLANK)
+		return 0;
+
+	blank = *(int *)((struct fb_event *)data)->data;
+
+	if (blank == FB_BLANK_UNBLANK) { /*LCD ON*/
+#ifdef CONFIG_KSM_GO
+		ksm_run_change(KSM_RUN_STOP);
+#else
+		ksm_run_change(KSM_RUN_MERGE);
+#endif
+	} else if (blank == FB_BLANK_POWERDOWN) { /*LCD OFF*/
+#ifdef CONFIG_KSM_GO
+		ksm_find_same_page = true;
+		ksm_run_change(KSM_RUN_MERGE);
+#else
+		ksm_run_change(KSM_RUN_STOP);
+#endif
+	}
+
+	return 0;
+}
+
+static struct notifier_block ksm_fb_notifier = {
+	.notifier_call = ksm_fb_notifier_callback,
+};
+#endif
+#else /* no KSM_KCTL_INTERFACE*/
+static ssize_t ksm_run_change(unsigned long flags)
+{
+}
+#endif
+EXPORT_SYMBOL(ksm_run_change);
+
 static int ksmd_should_run(void)
 {
 	return (ksm_run & KSM_RUN_MERGE) && !list_empty(&ksm_mm_head.mm_list);
@@ -1714,13 +1879,19 @@ static int ksmd_should_run(void)
 static int ksm_scan_thread(void *nothing)
 {
 	set_freezable();
-	set_user_nice(current, 5);
+	/* M: set KSMD's priority to the lowest value */
+	set_user_nice(current, 19);
+	/* set_user_nice(current, 5); */
 
 	while (!kthread_should_stop()) {
 		mutex_lock(&ksm_thread_mutex);
 		wait_while_offlining();
-		if (ksmd_should_run())
+		if (ksmd_should_run()) {
+		#ifdef KSM_KCTL_INTERFACE
+			ksm_tuning_pressure();
+		#endif
 			ksm_do_scan(ksm_thread_pages_to_scan);
+		}
 		mutex_unlock(&ksm_thread_mutex);
 
 		try_to_freeze();
@@ -2332,6 +2503,21 @@ static int __init ksm_init(void)
 	/* There is no significance to this priority 100 */
 	hotplug_memory_notifier(ksm_memory_callback, 100);
 #endif
+
+#ifdef KSM_KCTL_INTERFACE
+#ifdef CONFIG_HAS_EARLYSUSPEND
+	register_early_suspend(&ksm_early_suspend_handler);
+#else
+	err = fb_register_client(&ksm_fb_notifier);
+	if (err) {
+		pr_err("ksm: unable to register fb_notifier\n");
+		kthread_stop(ksm_thread);
+		sysfs_remove_group(mm_kobj, &ksm_attr_group);
+		goto out_free;
+	}
+#endif
+#endif
+
 	return 0;
 
 out_free:
